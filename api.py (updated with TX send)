@@ -1,0 +1,119 @@
+from flask import Flask, request, jsonify, send_from_directory
+from wallet import generate_keys, save_wallet, sign, verify
+from blockchain import Blockchain
+from stake import create_wallet, stake, pick_validator, reward_validator, load_balances, load_stakes, save_balances
+import p2p
+import txpool
+import os
+
+app = Flask(__name__)
+chain = Blockchain()
+
+# ==== Peer sync on startup ====
+def replace_chain(new_chain_data):
+    chain.chain = [chain.dict_to_block(b) for b in new_chain_data]
+    print("✅ Local chain replaced with longer peer chain.")
+
+p2p.start_sync(chain, replace_chain)
+
+# ==== Wallet & Blockchain Routes ====
+@app.route("/wallet/new", methods=["POST"])
+def new_wallet():
+    private, public, address = generate_keys()
+    save_wallet(private, public, address)
+    create_wallet(address)
+    return jsonify({"address": address, "public": public, "private": private}), 201
+
+@app.route("/wallet/<address>/balance", methods=["GET"])
+def get_balance(address):
+    balances = load_balances()
+    return jsonify({"balance": balances.get(address, 0)})
+
+@app.route("/wallet/<address>/stake", methods=["POST"])
+def stake_coins(address):
+    amount = request.json.get("amount")
+    if stake(address, amount):
+        return jsonify({"message": "Staked successfully"}), 200
+    return jsonify({"error": "Not enough balance"}), 400
+
+@app.route("/block/new", methods=["POST"])
+def new_block():
+    validator = pick_validator()
+    if not validator:
+        return jsonify({"error": "No validators available"}), 400
+    txs = txpool.get_valid_transactions()
+    block_data = {"transactions": txs}
+    block = chain.add_block(block_data, validator)
+    reward_validator(validator)
+
+    # Apply transactions
+    balances = load_balances()
+    for tx in txs:
+        sender = tx["sender"]
+        recipient = tx["recipient"]
+        amount = tx["amount"]
+        if balances.get(sender, 0) >= amount:
+            balances[sender] -= amount
+            balances[recipient] = balances.get(recipient, 0) + amount
+    save_balances(balances)
+
+    txpool.remove_transactions(txs)
+    p2p.broadcast_new_block(block.__dict__)
+    return jsonify({"message": f"Block added by {validator}", "txs": txs}), 201
+
+@app.route("/chain", methods=["GET"])
+def get_chain():
+    return jsonify([b.__dict__ for b in chain.chain])
+
+@app.route("/stakes", methods=["GET"])
+def get_stakes():
+    return jsonify(load_stakes())
+
+# ==== P2P Networking Routes ====
+@app.route("/peers", methods=["GET"])
+def get_peers():
+    return jsonify(p2p.KNOWN_PEERS)
+
+@app.route("/peers/add", methods=["POST"])
+def add_peer():
+    peer_url = request.json.get("url")
+    if p2p.register_peer(peer_url):
+        return jsonify({"message": "Peer added"}), 201
+    return jsonify({"message": "Already known"}), 200
+
+@app.route("/broadcast/block", methods=["POST"])
+def receive_block():
+    block_data = request.get_json()
+    block = chain.dict_to_block(block_data)
+    chain.add_block(block.data, block.validator)
+    return jsonify({"message": "Block accepted"}), 200
+
+@app.route("/broadcast/tx", methods=["POST"])
+def receive_tx():
+    tx = request.get_json()
+    if txpool.add_transaction(tx):
+        return jsonify({"message": "Transaction accepted"}), 200
+    return jsonify({"error": "Invalid transaction"}), 400
+
+# ==== TX Send ====
+@app.route("/tx/send", methods=["POST"])
+def send_tx():
+    tx = request.get_json()
+    if txpool.add_transaction(tx):
+        p2p.broadcast_new_tx(tx)
+        return jsonify({"message": "Transaction submitted"}), 200
+    return jsonify({"error": "Invalid transaction"}), 400
+
+@app.route("/mempool", methods=["GET"])
+def get_mempool():
+    return jsonify(txpool.load_mempool())
+
+# ==== Frontend UI ====
+@app.route("/")
+def serve_index():
+    return send_from_directory("frontend", "index.html")
+
+if __name__ == "__main__":
+    os.makedirs("storage", exist_ok=True)
+    p2p.load_peers()
+    app.run(port=5000)
